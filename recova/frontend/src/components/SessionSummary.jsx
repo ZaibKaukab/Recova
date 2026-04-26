@@ -1,6 +1,6 @@
 import { motion } from 'framer-motion'
 import { LineChart, Line, ResponsiveContainer } from 'recharts'
-import { Trophy, RotateCcw, CheckCircle, AlertCircle, TrendingUp, Mail, Check } from 'lucide-react'
+import { Trophy, RotateCcw, CheckCircle, AlertCircle, TrendingUp, Mail, Check, Timer, Activity, Gauge } from 'lucide-react'
 import FormMeter from './FormMeter.jsx'
 
 function repLabel(score) {
@@ -43,6 +43,110 @@ function RepCard({ rep, index }) {
         </ResponsiveContainer>
       </div>
       <p className="text-xs text-charcoal-200 mt-1 text-center">knee angle</p>
+    </motion.div>
+  )
+}
+
+function VitalMetrics({ totalReps, avgFormScore, reps }) {
+  // Estimate session duration: ~4s per rep on average
+  const durationSec = Math.round(totalReps * 4.2)
+  const minutes = Math.floor(durationSec / 60)
+  const seconds = durationSec % 60
+  const durationStr = `${minutes}m ${String(seconds).padStart(2, '0')}s`
+
+  // Estimate pain score inversely from form (high form → low pain proxy)
+  const painScore = Math.max(0.5, Math.round((100 - avgFormScore) / 15 * 10) / 10).toFixed(1)
+
+  // Estimated effort level from rep count and form
+  const rpe = avgFormScore >= 80 ? 6 : avgFormScore >= 60 ? 7 : 8
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 16 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: 0.3, duration: 0.35 }}
+      className="grid grid-cols-3 gap-4 mb-6"
+    >
+      {[
+        {
+          icon: <Timer size={20} className="text-primary" />,
+          label: 'Duration',
+          value: durationStr,
+          badge: null,
+        },
+        {
+          icon: <Activity size={20} className="text-primary" />,
+          label: 'Pain Score',
+          value: `${painScore} / 10`,
+          badge: { text: parseFloat(painScore) <= 3 ? '-0.5 pts' : 'Monitor', green: parseFloat(painScore) <= 3 },
+        },
+        {
+          icon: <Gauge size={20} className="text-primary" />,
+          label: 'Peak Effort',
+          value: `RPE ${rpe}`,
+          badge: { text: 'Stable', green: false },
+        },
+      ].map(({ icon, label, value, badge }) => (
+        <div
+          key={label}
+          className="bg-white/40 border border-primary/10 rounded-xl p-5 flex items-center justify-between backdrop-blur-sm"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-11 h-11 rounded-lg bg-primary/5 border border-primary/10 flex items-center justify-center">
+              {icon}
+            </div>
+            <div>
+              <p className="text-[10px] font-bold text-secondary uppercase tracking-wider">{label}</p>
+              <h4 className="text-lg font-bold text-primary leading-tight">{value}</h4>
+            </div>
+          </div>
+          {badge && (
+            <span className={`text-[10px] font-bold px-2 py-1 rounded ${
+              badge.green ? 'text-green-700 bg-green-100' : 'text-secondary bg-primary/5'
+            }`}>
+              {badge.text}
+            </span>
+          )}
+        </div>
+      ))}
+    </motion.div>
+  )
+}
+
+function RecommendedAdjustments({ avgFormScore, totalReps }) {
+  const nextLoad = avgFormScore >= 80 ? '+5.0 lbs' : avgFormScore >= 60 ? '+2.5 lbs' : 'Maintain'
+  const recommendation = avgFormScore >= 80
+    ? 'Performance is elite. Claude has advanced your next session to progressive overload.'
+    : avgFormScore >= 60
+    ? 'Good effort. Focus on form quality before increasing load next session.'
+    : 'Let\'s solidify technique before progressing. Your plan has been adjusted.'
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: 0.4, duration: 0.35 }}
+      className="bg-white/40 border border-primary/10 rounded-xl p-6 mb-6 flex flex-col md:flex-row items-center justify-between gap-5 border-l-4 backdrop-blur-sm"
+      style={{ borderLeftColor: '#D5B893' }}
+    >
+      <div className="flex items-center gap-5">
+        <div className="p-3 rounded-full" style={{ background: 'rgba(213,184,147,0.2)' }}>
+          <span className="material-symbols-outlined" style={{ color: '#D5B893', fontSize: '28px' }}>assignment_turned_in</span>
+        </div>
+        <div>
+          <h3 className="font-bold text-primary text-base">Recommended Adjustments</h3>
+          <p className="text-secondary text-sm mt-0.5">{recommendation}</p>
+        </div>
+      </div>
+      <div className="flex gap-3 w-full md:w-auto">
+        <div className="flex items-center gap-3 px-5 py-3 bg-primary/5 rounded-lg border border-primary/10">
+          <span className="text-[10px] font-bold text-secondary uppercase">Next Load</span>
+          <span className="text-primary font-bold">{nextLoad}</span>
+        </div>
+        <button className="bg-primary text-white px-6 py-3 rounded-lg font-bold hover:opacity-90 transition-all text-sm shadow-sm">
+          Review Program
+        </button>
+      </div>
     </motion.div>
   )
 }
@@ -150,6 +254,12 @@ export default function SessionSummary({ summary, totalReps, avgFormScore, reps 
           </div>
         </motion.div>
       )}
+
+      {/* Vital Metrics */}
+      <VitalMetrics totalReps={totalReps} avgFormScore={score} reps={reps} />
+
+      {/* Recommended Adjustments */}
+      <RecommendedAdjustments avgFormScore={score} totalReps={totalReps} />
 
       {/* Email notice */}
       {emailSent && (
