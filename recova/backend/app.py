@@ -5,6 +5,7 @@ from database import (
     insert_session, update_session, get_all_patients_with_last_session
 )
 from claude import get_rep_feedback, get_session_summary
+from email_service import send_session_email
 
 app = Flask(__name__)
 CORS(app)
@@ -79,5 +80,22 @@ def clinician_patient_detail(patient_id):
     return jsonify({"sessions": result})
 
 
+@app.route("/api/session/email", methods=["POST"])
+def email_summary():
+    data = request.json or {}
+    to_email = data.get("email")
+    patient_name = data.get("patient_name", "")
+    form_score = data.get("avg_form_score", 0)
+    total_reps = data.get("total_reps", 0)
+    summary = data.get("summary", "")
+    reps = data.get("reps", [])
+
+    if not to_email:
+        return jsonify({"error": "email required"}), 400
+
+    result = send_session_email(to_email, patient_name, form_score, total_reps, summary, reps)
+    return jsonify(result)
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5001)

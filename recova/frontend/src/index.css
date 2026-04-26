@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Manrope', system-ui, sans-serif;
+
+  /* Surface — oatmeal system */
+  --color-surface: #E7E2DB;
+  --color-surface-dim: #D8D1C7;
+  --color-surface-container: #E1D9CD;
+  --color-surface-low: #E4DDD1;
+  --color-surface-high: #CBC3B7;
+  --color-surface-white: #FFFFFF;
+
+  /* Primary — Space Cadet navy */
+  --color-primary: #25344F;
+  --color-primary-dark: #1A2440;
+  --color-on-primary: #FFFFFF;
+  --color-primary-muted: #8E9DBD;
+
+  /* Secondary — Slate Gray */
+  --color-secondary: #617891;
+
+  /* Tertiary accent — warm gold */
+  --color-gold: #D5B893;
+
+  /* Text */
+  --color-on-surface: #191C1D;
+
+  /* Borders */
+  --color-outline: #CBC3B7;
+
+  /* Status */
+  --color-error: #BA1A1A;
+  --color-error-bg: #FFDAD6;
+  --color-success: #1A6B32;
+  --color-success-bg: #D4EDDA;
+
+  /* Shadows */
+  --shadow-soft: 0 2px 12px rgba(37, 52, 79, 0.06);
+  --shadow-card: 0 4px 24px rgba(37, 52, 79, 0.08);
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+
+  * {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: #E7E2DB;
+    color: #191C1D;
+    font-family: var(--font-sans);
+  }
+
+  .material-symbols-outlined {
+    font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+    font-size: 20px;
+    line-height: 1;
+    vertical-align: middle;
+    display: inline-block;
+  }
+}
+
+@layer utilities {
+  .data-card {
+    background: rgba(255, 255, 255, 0.4);
+    border: 1px solid rgba(37, 52, 79, 0.1);
+    border-radius: 12px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+
+  .data-card-solid {
+    background: rgba(255, 255, 255, 0.75);
+    border: 1px solid rgba(37, 52, 79, 0.1);
+    border-radius: 12px;
+  }
+
+  .fill-icon {
+    font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  }
+}
