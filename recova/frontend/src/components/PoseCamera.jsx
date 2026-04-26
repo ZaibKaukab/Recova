@@ -1,354 +1,563 @@
 import { useEffect, useRef, useState } from 'react'
-import { motion } from 'framer-motion'
 
-const STATE = { IDLE: 'IDLE', PHASE1: 'PHASE1', HOLD: 'HOLD', PHASE2: 'PHASE2' }
+// Globals from MediaPipe CDN in index.html:
+// window.Pose, window.Camera, window.drawConnectors,
+// window.drawLandmarks, window.POSE_CONNECTIONS
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Exercise configuration map
+// leftJoints / rightJoints: [proximal, vertex, distal] landmark indices
+// trackMin: true → record lowest angle (squat, bicep_curl)
+//           false → record highest angle (shoulder_flexion)
+// ─────────────────────────────────────────────────────────────────────────────
+const EXERCISE_CONFIGS = {
+  squat: {
+    leftJoints:  [23, 25, 27],   // hip, knee, ankle
+    rightJoints: [24, 26, 28],
+    angleLabel:  'KNEE',
+    angleKey:    'knee_angle',
+    trackMin:    true,
+    stateLabels: { IDLE: 'IDLE', DESCENDING: 'DESCENDING', HOLD: 'HOLD', ASCENDING: 'ASCENDING' },
+    audio:       { start: 'Going down', hold: 'Good, hold it', return: 'Push back up' },
+  },
+  shoulder_flexion: {
+    leftJoints:  [23, 11, 13],   // hip, shoulder, elbow  (shoulder is vertex)
+    rightJoints: [24, 12, 14],
+    angleLabel:  'SHOULDER',
+    angleKey:    'shoulder_angle',
+    trackMin:    false,           // record peak (highest) angle
+    stateLabels: { IDLE: 'IDLE', DESCENDING: 'LIFTING', HOLD: 'HOLD', ASCENDING: 'LOWERING' },
+    audio:       { start: 'Lift your arm', hold: 'Hold it there', return: 'Lower slowly' },
+  },
+  bicep_curl: {
+    leftJoints:  [11, 13, 15],   // shoulder, elbow, wrist  (elbow is vertex)
+    rightJoints: [12, 14, 16],
+    angleLabel:  'ELBOW',
+    angleKey:    'elbow_angle',
+    trackMin:    true,
+    stateLabels: { IDLE: 'IDLE', DESCENDING: 'CURLING', HOLD: 'HOLD', ASCENDING: 'LOWERING' },
+    audio:       { start: 'Curl up', hold: 'Hold it', return: 'Lower slowly' },
+  },
+}
+
+const STATE = { IDLE: 'IDLE', DESCENDING: 'DESCENDING', HOLD: 'HOLD', ASCENDING: 'ASCENDING' }
+
+const STATE_COLOR = {
+  IDLE: '#6B7280',
+  DESCENDING: '#14B8A6',
+  HOLD: '#14B8A6',
+  ASCENDING: '#F97316',
+}
 
 function getAngle(a, b, c) {
   const ba = { x: a.x - b.x, y: a.y - b.y }
   const bc = { x: c.x - b.x, y: c.y - b.y }
   const dot = ba.x * bc.x + ba.y * bc.y
-  const mag = Math.sqrt(ba.x ** 2 + ba.y ** 2) * Math.sqrt(bc.x ** 2 + bc.y ** 2)
-  return Math.acos(Math.min(1, Math.max(-1, dot / mag))) * (180 / Math.PI)
+  const magBA = Math.sqrt(ba.x ** 2 + ba.y ** 2)
+  const magBC = Math.sqrt(bc.x ** 2 + bc.y ** 2)
+  return Math.acos(Math.min(1, Math.max(-1, dot / (magBA * magBC)))) * (180 / Math.PI)
 }
 
-// Per-exercise config: how to get the primary angle and when to detect a rep
-const EXERCISE_CONFIG = {
-  squat: {
-    getPrimaryAngle: (lm) => getAngle(lm[23], lm[25], lm[27]),
-    getSecondaryAngle: (lm) => getAngle(lm[11], lm[23], lm[25]),
-    startAngle: 170,      // standing — above this = IDLE
-    phase1Threshold: 150, // start descending
-    holdThreshold: 90,    // bottom of squat
-    completeAngle: 158,   // back to standing
-    angleLabel: 'Knee',
-    cues: {
-      ready: 'Ready — perform a squat',
-      phase1: 'Descending — keep going',
-      hold: 'Good depth! Hold briefly...',
-      phase2: 'Ascending — push through!',
-      done: (n, s) => `Rep ${n} done! Form: ${s}%`,
-    },
-  },
-  bicep_curl: {
-    getPrimaryAngle: (lm) => getAngle(lm[11], lm[13], lm[15]),
-    getSecondaryAngle: () => 90,
-    startAngle: 160,
-    phase1Threshold: 150, // start curling
-    holdThreshold: 55,    // fully curled
-    completeAngle: 155,   // arm extended
-    angleLabel: 'Elbow',
-    cues: {
-      ready: 'Ready — perform a bicep curl',
-      phase1: 'Curling up — keep it controlled',
-      hold: 'Full contraction! Hold...',
-      phase2: 'Lowering — control the descent',
-      done: (n, s) => `Rep ${n} done! Form: ${s}%`,
-    },
-  },
-  shoulder_flexion: {
-    getPrimaryAngle: (lm) => getAngle(lm[23], lm[11], lm[13]),
-    getSecondaryAngle: () => 90,
-    startAngle: 165,
-    phase1Threshold: 158, // arm starts rising
-    holdThreshold: 85,    // arm at ~90°
-    completeAngle: 158,   // arm back at side
-    angleLabel: 'Shoulder',
-    cues: {
-      ready: 'Ready — raise your arm forward',
-      phase1: 'Raising arm — slow and steady',
-      hold: 'Hold at 90° — good control!',
-      phase2: 'Lowering — resist gravity',
-      done: (n, s) => `Rep ${n} done! Form: ${s}%`,
-    },
-  },
+function avgVis(lm, indices) {
+  return indices.reduce((s, i) => s + (lm[i]?.visibility ?? 0), 0) / indices.length
 }
 
-// ── Mock skeleton ──────────────────────────────────────────────────────────
-const MOCK_CONNECTIONS = [
-  ['nose', 'leftShoulder'], ['nose', 'rightShoulder'],
-  ['leftShoulder', 'rightShoulder'],
-  ['leftShoulder', 'leftElbow'], ['leftElbow', 'leftWrist'],
-  ['rightShoulder', 'rightElbow'], ['rightElbow', 'rightWrist'],
-  ['leftShoulder', 'leftHip'], ['rightShoulder', 'rightHip'],
-  ['leftHip', 'rightHip'],
-  ['leftHip', 'leftKnee'], ['leftKnee', 'leftAnkle'],
-  ['rightHip', 'rightKnee'], ['rightKnee', 'rightAnkle'],
-]
-
-function getMockJoints(phase, exerciseType) {
-  if (exerciseType === 'bicep_curl') {
-    const curl = phase
-    return {
-      nose: [320, 50],
-      leftShoulder: [272, 165], rightShoulder: [368, 165],
-      leftElbow: [238, 252], rightElbow: [402, 252],
-      leftWrist:  [220 + curl * 22, 335 - curl * 115],
-      rightWrist: [420 - curl * 22, 335 - curl * 115],
-      leftHip: [280, 316], rightHip: [360, 316],
-      leftKnee: [268, 390], rightKnee: [372, 390],
-      leftAnkle: [260, 440], rightAnkle: [380, 440],
-    }
-  }
-  if (exerciseType === 'shoulder_flexion') {
-    const raise = phase
-    return {
-      nose: [320, 50],
-      leftShoulder: [272, 165], rightShoulder: [368, 165],
-      leftElbow:  [272 - raise * 28, 252 - raise * 120],
-      rightElbow: [402, 252],
-      leftWrist:  [265 - raise * 40, 338 - raise * 200],
-      rightWrist: [420, 338],
-      leftHip: [280, 316], rightHip: [360, 316],
-      leftKnee: [268, 390], rightKnee: [372, 390],
-      leftAnkle: [260, 440], rightAnkle: [380, 440],
-    }
-  }
-  // squat (default)
-  const kY = 0.60 + phase * 0.14
-  return {
-    nose: [320, 50],
-    leftShoulder: [272, 165], rightShoulder: [368, 165],
-    leftElbow: [238, 248], rightElbow: [402, 248],
-    leftWrist: [220, 330], rightWrist: [420, 330],
-    leftHip: [280, 316], rightHip: [360, 316],
-    leftKnee: [264, kY * 480], rightKnee: [376, kY * 480],
-    leftAnkle: [256, 422], rightAnkle: [384, 422],
-  }
+// All text on a CSS-mirrored canvas comes out backwards.
+// counter-transform undoes scaleX(-1) so text draws readable at visual coords.
+function withCounterMirror(ctx, canvas, fn) {
+  ctx.save()
+  ctx.translate(canvas.width, 0)
+  ctx.scale(-1, 1)
+  fn()
+  ctx.restore()
 }
 
-// Which joints to highlight for each exercise
-const ACTIVE_BONES = {
-  squat:            (a, b) => a.includes('Knee') || b.includes('Knee') || a.includes('Hip') || b.includes('Hip'),
-  bicep_curl:       (a, b) => a.includes('Elbow') || b.includes('Elbow') || a.includes('Wrist') || b.includes('Wrist'),
-  shoulder_flexion: (a, b) => a.includes('Shoulder') || b.includes('Shoulder') || a.includes('Elbow') || b.includes('Elbow'),
+function drawRoundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath()
+  ctx.moveTo(x + r, y)
+  ctx.lineTo(x + w - r, y)
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r)
+  ctx.lineTo(x + w, y + h - r)
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h)
+  ctx.lineTo(x + r, y + h)
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r)
+  ctx.lineTo(x, y + r)
+  ctx.quadraticCurveTo(x, y, x + r, y)
+  ctx.closePath()
 }
 
-// ── Component ──────────────────────────────────────────────────────────────
-export default function PoseCamera({ patient, sessionId, onRep, mockMode = false, exerciseType = 'squat' }) {
-  const videoRef = useRef(null)
+function repStateColor(displayLabel) {
+  if (['IDLE'].includes(displayLabel)) return 'IDLE'
+  if (['DESCENDING', 'LIFTING', 'CURLING'].includes(displayLabel)) return 'DESCENDING'
+  if (['HOLD'].includes(displayLabel)) return 'HOLD'
+  if (['ASCENDING', 'LOWERING'].includes(displayLabel)) return 'ASCENDING'
+  return 'IDLE'
+}
+
+function drawCanvasHUD(ctx, canvas, angle, stateLabel, repCount, angleLabel) {
+  withCounterMirror(ctx, canvas, () => {
+    const stateColor = STATE_COLOR[repStateColor(stateLabel)] ?? '#6B7280'
+    const pad = 14
+
+    ctx.fillStyle = 'rgba(0,0,0,0.65)'
+    drawRoundRect(ctx, pad, pad, 200, 68, 10)
+    ctx.fill()
+    ctx.fillStyle = stateColor
+    ctx.font = 'bold 13px system-ui, sans-serif'
+    ctx.fillText(stateLabel, pad + 12, pad + 22)
+    ctx.fillStyle = '#FFFFFF'
+    ctx.font = 'bold 32px system-ui, sans-serif'
+    ctx.fillText(`${Math.round(angle)}°`, pad + 12, pad + 58)
+    ctx.fillStyle = '#9CA3AF'
+    ctx.font = '11px system-ui, sans-serif'
+    ctx.fillText(angleLabel, pad + 80, pad + 58)
+
+    const repLabel = `REPS  ${repCount}`
+    ctx.font = 'bold 15px system-ui, sans-serif'
+    const tw = ctx.measureText(repLabel).width
+    const rx = canvas.width - pad - tw - 20
+    ctx.fillStyle = 'rgba(0,0,0,0.65)'
+    drawRoundRect(ctx, rx - 8, pad, tw + 16, 34, 8)
+    ctx.fill()
+    ctx.fillStyle = '#FFFFFF'
+    ctx.fillText(repLabel, rx, pad + 23)
+  })
+}
+
+function drawAngleAtKnee(ctx, canvas, vertexLandmark, angle) {
+  withCounterMirror(ctx, canvas, () => {
+    const kx = (1 - vertexLandmark.x) * canvas.width
+    const ky = vertexLandmark.y * canvas.height
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'
+    drawRoundRect(ctx, kx + 14, ky - 24, 56, 22, 5)
+    ctx.fill()
+    ctx.fillStyle = '#FFFFFF'
+    ctx.font = 'bold 14px system-ui, sans-serif'
+    ctx.fillText(`${Math.round(angle)}°`, kx + 18, ky - 7)
+  })
+}
+
+function drawWarningOnCanvas(ctx, canvas, message) {
+  withCounterMirror(ctx, canvas, () => {
+    const cx = canvas.width / 2
+    const cy = canvas.height / 2
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'
+    drawRoundRect(ctx, cx - 230, cy - 30, 460, 60, 12)
+    ctx.fill()
+    ctx.fillStyle = '#FBBF24'
+    ctx.font = 'bold 16px system-ui, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.fillText('⚠  ' + message, cx, cy + 7)
+    ctx.textAlign = 'left'
+  })
+}
+
+const speak = (text) => {
+  window.speechSynthesis.cancel()
+  const utterance = new SpeechSynthesisUtterance(text)
+  const voices = window.speechSynthesis.getVoices()
+  const macVoice = voices.find(v =>
+    v.name === 'Samantha' ||
+    v.name === 'Daniel' ||
+    v.voiceURI.includes('Premium')
+  )
+  if (macVoice) utterance.voice = macVoice
+  utterance.rate = 0.9
+  window.speechSynthesis.speak(utterance)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mockMode: skips camera entirely and draws a static placeholder.
+// Used by Student D's demo fallback when the live camera fails during judging.
+// ─────────────────────────────────────────────────────────────────────────────
+function drawMockCanvas(canvas) {
+  const ctx = canvas.getContext('2d')
+  canvas.width  = 640
+  canvas.height = 480
+  ctx.fillStyle = '#111827'
+  ctx.fillRect(0, 0, 640, 480)
+  ctx.fillStyle = '#374151'
+  ctx.fillRect(240, 60, 160, 360)
+  ctx.fillStyle = '#6B7280'
+  ctx.font = 'bold 18px system-ui'
+  ctx.textAlign = 'center'
+  ctx.fillText('DEMO MODE', 320, 260)
+  ctx.font = '13px system-ui'
+  ctx.fillStyle = '#9CA3AF'
+  ctx.fillText('Pre-recorded session active', 320, 285)
+  ctx.textAlign = 'left'
+}
+
+export default function PoseCamera({ patient, sessionId, onRep, exerciseType = 'squat', mockMode = false }) {
+  const videoRef  = useRef(null)
   const canvasRef = useRef(null)
 
-  const repStateRef = useRef(STATE.IDLE)
-  const repCountRef = useRef(0)
-  const angleHistoryRef = useRef([])
-  const repAnglesRef = useRef([])
+  // Forwarding refs — always-current, no stale-closure risk
+  const onRepRef        = useRef(onRep)
+  const patientRef      = useRef(patient)
+  const exerciseTypeRef = useRef(exerciseType)
+  useEffect(() => { onRepRef.current = onRep },               [onRep])
+  useEffect(() => { patientRef.current = patient },           [patient])
+  useEffect(() => { exerciseTypeRef.current = exerciseType }, [exerciseType])
 
-  const [status, setStatus] = useState('Initializing...')
-  const [currentAngle, setCurrentAngle] = useState(null)
+  // State machine refs
+  const repStateRef    = useRef(STATE.IDLE)
+  const repCountRef    = useRef(0)
+  const angleHistoryRef = useRef([])
+  const repFiredRef    = useRef(false)
+
+  // Peak angle tracking: squat/bicep_curl track min, shoulder_flexion tracks max
+  const minAngleThisRepRef = useRef(Infinity)
+  const maxAngleThisRepRef = useRef(-Infinity)
+
+  // Feature 2: ghost frame patience
+  const badFrameCountRef = useRef(0)
+
+  // Feature 4: eccentric velocity tracking
+  const lastTimeRef  = useRef(null)
+  const lastAngleRef = useRef(null)
+
+  // Per-rep accumulated flags (velocity + posture events)
+  const currentRepFlagsRef = useRef([])
+
+  // Bicep curl: baseline torso angle at start of CURLING
+  const torsoAtCurlStartRef = useRef(null)
+
+  // Audio: dedup so warnings speak only once per distinct condition
+  const lastWarningRef = useRef('')
+
+  const [repCount, setRepCount]     = useState(0)
   const [cameraError, setCameraError] = useState(false)
 
-  const config = EXERCISE_CONFIG[exerciseType] ?? EXERCISE_CONFIG.squat
-  const isActiveBone = ACTIVE_BONES[exerciseType] ?? ACTIVE_BONES.squat
-
-  // Reset rep state when exercise type changes
-  useEffect(() => {
-    repStateRef.current = STATE.IDLE
-    repAnglesRef.current = []
-    angleHistoryRef.current = []
-    setCurrentAngle(null)
-  }, [exerciseType])
-
-  // ── Mock mode ──────────────────────────────────────────────────────────
+  // Mock mode: draw placeholder and skip all camera + MediaPipe logic
   useEffect(() => {
     if (!mockMode) return
     const canvas = canvasRef.current
-    const ctx = canvas.getContext('2d')
-    canvas.width = 640
-    canvas.height = 480
+    if (canvas) drawMockCanvas(canvas)
+  }, [mockMode])
 
-    let frame = 0
-    let animId
-    let mockRepState = 'idle'
-    let mockRepCount = 0
-
-    const animate = () => {
-      frame++
-      const t = frame / 60
-      // 0→1→0 smooth cycle over ~4 seconds
-      const phase = (Math.sin(t * 0.78 - Math.PI / 2) + 1) / 2
-      const mockAngle = config.startAngle - phase * (config.startAngle - config.holdThreshold + 10)
-
-      // Detect mock rep
-      if (mockRepState === 'idle' && mockAngle < config.phase1Threshold) {
-        mockRepState = 'phase1'
-      } else if (mockRepState === 'phase1' && mockAngle <= config.holdThreshold + 5) {
-        mockRepState = 'hold'
-      } else if (mockRepState === 'hold' && mockAngle > config.holdThreshold + 10) {
-        mockRepState = 'phase2'
-      } else if (mockRepState === 'phase2' && mockAngle >= config.completeAngle) {
-        mockRepState = 'idle'
-        mockRepCount += 1
-        const formScore = 72 + Math.floor(Math.random() * 22)
-        onRep?.({
-          rep_number: mockRepCount,
-          set_number: 1,
-          knee_angle: Math.round(mockAngle),
-          hip_angle: 88,
-          form_score: formScore,
-          flags: '',
-          exercise_name: exerciseType,
-          target_min: patient?.target_angle_min ?? 70,
-          target_max: patient?.target_angle_max ?? 170,
-          session_id: sessionId,
-          angleHistory: Array.from({ length: 12 }, (_, i) =>
-            Math.round(config.startAngle - Math.sin((i / 11) * Math.PI) * (config.startAngle - config.holdThreshold))
-          ),
-        })
-      }
-
-      setCurrentAngle(Math.round(mockAngle))
-
-      // Draw background
-      ctx.fillStyle = '#0C0A09'
-      ctx.fillRect(0, 0, canvas.width, canvas.height)
-      ctx.strokeStyle = 'rgba(255,255,255,0.04)'
-      ctx.lineWidth = 1
-      for (let x = 0; x < 640; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 480); ctx.stroke() }
-      for (let y = 0; y < 480; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(640, y); ctx.stroke() }
-
-      const joints = getMockJoints(phase, exerciseType)
-      const isMoving = mockRepState !== 'idle'
-
-      // Bones
-      MOCK_CONNECTIONS.forEach(([a, b]) => {
-        const highlight = isActiveBone(a, b) && isMoving
-        ctx.strokeStyle = highlight ? 'rgba(194, 82, 58, 0.85)' : 'rgba(250, 245, 238, 0.45)'
-        ctx.lineWidth = 2.5
-        ctx.lineCap = 'round'
-        ctx.beginPath()
-        ctx.moveTo(joints[a][0], joints[a][1])
-        ctx.lineTo(joints[b][0], joints[b][1])
-        ctx.stroke()
-      })
-
-      // Joints
-      Object.entries(joints).forEach(([name, [x, y]]) => {
-        const highlight = isActiveBone(name, name) && isMoving
-        ctx.beginPath()
-        ctx.arc(x, y, highlight ? 7 : 4.5, 0, Math.PI * 2)
-        ctx.fillStyle = highlight ? '#C2523A' : '#FF6B7A'
-        ctx.fill()
-      })
-
-      // Angle label
-      const anchor = exerciseType === 'bicep_curl' ? joints.leftElbow
-        : exerciseType === 'shoulder_flexion' ? joints.leftShoulder
-        : joints.leftKnee
-      const [kx, ky] = anchor
-      ctx.fillStyle = 'rgba(12, 10, 9, 0.75)'
-      ctx.beginPath(); ctx.roundRect(kx + 12, ky - 22, 80, 24, 5); ctx.fill()
-      ctx.fillStyle = '#FAF5EE'
-      ctx.font = 'bold 13px Inter, system-ui'
-      ctx.fillText(`${config.angleLabel} ${Math.round(mockAngle)}°`, kx + 17, ky - 4)
-
-      animId = requestAnimationFrame(animate)
-    }
-
-    animate()
-    setStatus(`Demo — ${exerciseType.replace('_', ' ')} simulation`)
-    return () => cancelAnimationFrame(animId)
-  }, [mockMode, exerciseType])
-
-  // ── Real MediaPipe ─────────────────────────────────────────────────────
   useEffect(() => {
-    if (mockMode) return
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    const ctx = canvas.getContext('2d')
+    if (mockMode) return   // camera not needed in demo mode
 
-    if (!window.Pose) { setStatus('MediaPipe failed to load — refresh the page.'); return }
+    const video  = videoRef.current
+    const canvas = canvasRef.current
+    const ctx    = canvas.getContext('2d')
+
+    if (!window.Pose) {
+      ctx.fillStyle = '#EF4444'
+      ctx.font = '16px system-ui'
+      ctx.fillText('MediaPipe not loaded — refresh the page.', 20, 40)
+      return
+    }
 
     const pose = new window.Pose({
       locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
     })
-    pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, enableSegmentation: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 })
+
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      enableSegmentation: false,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    })
 
     pose.onResults((results) => {
-      canvas.width = video.videoWidth || 640
+      canvas.width  = video.videoWidth  || 640
       canvas.height = video.videoHeight || 480
       ctx.clearRect(0, 0, canvas.width, canvas.height)
       ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height)
 
-      if (!results.poseLandmarks) { setStatus('No body detected — step back so your full body is visible'); return }
+      const lm  = results.poseLandmarks
+      const cfg = EXERCISE_CONFIGS[exerciseTypeRef.current] ?? EXERCISE_CONFIGS.squat
 
-      const lm = results.poseLandmarks
-      const keyIndices = [11, 13, 15, 23, 25, 27]
-      const lowConf = keyIndices.some(i => lm[i].visibility < 0.5)
-      setStatus(lowConf ? "Move to better lighting — can't see your full body clearly" : config.cues.ready)
+      // ── Feature 1: Dynamic side selection ────────────────────────────
+      const leftVis  = lm ? avgVis(lm, cfg.leftJoints)  : 0
+      const rightVis = lm ? avgVis(lm, cfg.rightJoints) : 0
+      const useLeft  = leftVis >= rightVis
+      const activeVis = Math.max(leftVis, rightVis)
 
-      window.drawConnectors(ctx, lm, window.POSE_CONNECTIONS, { color: '#A0C0A3', lineWidth: 2.5 })
-      window.drawLandmarks(ctx, lm, { color: '#FF6B7A', lineWidth: 1, radius: 4 })
-
-      const primaryAngle = config.getPrimaryAngle(lm)
-      const secondaryAngle = config.getSecondaryAngle(lm)
-      setCurrentAngle(Math.round(primaryAngle))
-
-      // Angle label on canvas
-      const refLm = exerciseType === 'bicep_curl' ? lm[13]
-        : exerciseType === 'shoulder_flexion' ? lm[11]
-        : lm[25]
-      const kx = refLm.x * canvas.width
-      const ky = refLm.y * canvas.height
-      ctx.fillStyle = 'rgba(12, 10, 9, 0.7)'
-      ctx.beginPath(); ctx.roundRect(kx + 10, ky - 22, 84, 24, 5); ctx.fill()
-      ctx.fillStyle = '#FAF5EE'
-      ctx.font = 'bold 13px Inter, system-ui'
-      ctx.fillText(`${config.angleLabel} ${Math.round(primaryAngle)}°`, kx + 14, ky - 4)
-
-      // Smooth angle
-      angleHistoryRef.current.push(primaryAngle)
-      if (angleHistoryRef.current.length > 8) angleHistoryRef.current.shift()
-      const smooth = angleHistoryRef.current.reduce((a, b) => a + b, 0) / angleHistoryRef.current.length
-
-      const targetMin = patient?.target_angle_min ?? config.holdThreshold
-      const targetMax = patient?.target_angle_max ?? config.startAngle
-      const state = repStateRef.current
-
-      if (state === STATE.IDLE && smooth < config.phase1Threshold) {
-        repStateRef.current = STATE.PHASE1
-        setStatus(config.cues.phase1)
-        repAnglesRef.current = [Math.round(primaryAngle)]
-      } else if (state === STATE.PHASE1 && smooth <= config.holdThreshold + 8) {
-        repStateRef.current = STATE.HOLD
-        setStatus(config.cues.hold)
-        repAnglesRef.current.push(Math.round(primaryAngle))
-      } else if (state === STATE.HOLD && smooth > config.holdThreshold + 12) {
-        repStateRef.current = STATE.PHASE2
-        setStatus(config.cues.phase2)
-        repAnglesRef.current.push(Math.round(primaryAngle))
-      } else if (state === STATE.PHASE2 && smooth >= config.completeAngle) {
-        repStateRef.current = STATE.IDLE
-        repCountRef.current += 1
-
-        const depthDelta = smooth - targetMin
-        const depthScore = depthDelta <= 0 ? 40 : Math.max(0, 40 - depthDelta * 1.2)
-        const secDelta = Math.abs(secondaryAngle - 90)
-        const alignScore = secDelta <= 20 ? 25 : Math.max(0, 25 - (secDelta - 20) * 0.8)
-        const formScore = Math.min(100, Math.round(depthScore + alignScore + 35))
-
-        const flags = []
-        if (depthDelta > 20) flags.push('insufficient_depth')
-        if (secDelta > 30) flags.push('alignment_issue')
-
-        setStatus(config.cues.done(repCountRef.current, formScore))
-
-        onRep?.({
-          rep_number: repCountRef.current,
-          set_number: 1,
-          knee_angle: Math.round(primaryAngle),
-          hip_angle: Math.round(secondaryAngle),
-          form_score: formScore,
-          flags: flags.join(','),
-          exercise_name: exerciseType,
-          target_min: targetMin,
-          target_max: targetMax,
-          session_id: sessionId,
-          angleHistory: [...repAnglesRef.current],
-        })
-        repAnglesRef.current = []
-      } else if ([STATE.PHASE1, STATE.HOLD, STATE.PHASE2].includes(state)) {
-        repAnglesRef.current.push(Math.round(primaryAngle))
+      // ── Feature 2: Ghost frame patience counter ───────────────────────
+      const isBadFrame = !lm || activeVis < 0.6
+      if (isBadFrame) {
+        badFrameCountRef.current += 1
+        if (badFrameCountRef.current > 5) {
+          drawWarningOnCanvas(ctx, canvas, 'Please step fully into the frame.')
+          if (lastWarningRef.current !== 'step') {
+            lastWarningRef.current = 'step'
+            speak('Please step fully into the frame')
+          }
+        }
+        return
       }
+      badFrameCountRef.current = 0
+      lastWarningRef.current   = ''
+
+      const joints       = useLeft ? cfg.leftJoints : cfg.rightJoints
+      const j1           = lm[joints[0]]
+      const j2           = lm[joints[1]]
+      const j3           = lm[joints[2]]
+      const activeIndices = joints
+      const vertexIdx    = joints[1]
+
+      // ── Feature 3: Perspective validation ────────────────────────────
+      const shoulderWidth = Math.abs(lm[11].x - lm[12].x)
+      if (shoulderWidth > 0.15) {
+        window.drawConnectors(ctx, lm, window.POSE_CONNECTIONS, { color: '#374151', lineWidth: 2 })
+        window.drawLandmarks(ctx, lm, { color: '#6B7280', lineWidth: 1, radius: 3 })
+        drawWarningOnCanvas(ctx, canvas, 'Please turn sideways to the camera.')
+        if (lastWarningRef.current !== 'sideways') {
+          lastWarningRef.current = 'sideways'
+          speak('Please turn sideways to the camera')
+        }
+        return
+      }
+
+      // ── Standard skeleton ─────────────────────────────────────────────
+      window.drawConnectors(ctx, lm, window.POSE_CONNECTIONS, { color: '#374151', lineWidth: 2 })
+      window.drawLandmarks(ctx, lm, { color: '#6B7280', lineWidth: 1, radius: 3 })
+
+      const mainAngle   = getAngle(j1, j2, j3)
+      const isDanger    = exerciseTypeRef.current === 'squat' && mainAngle < 60
+      const highlightColor = isDanger ? '#EF4444' : '#00E5A0'
+
+      // ── Highlighted active joints ─────────────────────────────────────
+      for (const idx of activeIndices) {
+        const lx = lm[idx].x * canvas.width
+        const ly = lm[idx].y * canvas.height
+        ctx.beginPath()
+        ctx.arc(lx, ly, idx === vertexIdx ? 12 : 9, 0, 2 * Math.PI)
+        ctx.fillStyle = highlightColor
+        ctx.fill()
+        ctx.strokeStyle = '#FFFFFF'
+        ctx.lineWidth = 2.5
+        ctx.stroke()
+      }
+      ctx.beginPath()
+      ctx.moveTo(j1.x * canvas.width, j1.y * canvas.height)
+      ctx.lineTo(j2.x * canvas.width, j2.y * canvas.height)
+      ctx.lineTo(j3.x * canvas.width, j3.y * canvas.height)
+      ctx.strokeStyle = highlightColor
+      ctx.lineWidth = 4
+      ctx.stroke()
+
+      // ── Canvas HUD ────────────────────────────────────────────────────
+      const stateLabel = cfg.stateLabels[repStateRef.current] ?? repStateRef.current
+      drawCanvasHUD(ctx, canvas, mainAngle, stateLabel, repCountRef.current, cfg.angleLabel)
+      drawAngleAtKnee(ctx, canvas, j2, mainAngle)
+
+      // ── Smoothed angle (8-frame rolling average) ──────────────────────
+      angleHistoryRef.current.push(mainAngle)
+      if (angleHistoryRef.current.length > 8) angleHistoryRef.current.shift()
+      const smoothAngle =
+        angleHistoryRef.current.reduce((a, b) => a + b, 0) /
+        angleHistoryRef.current.length
+
+      const p         = patientRef.current
+      const targetMin = p?.target_angle_min ?? 85
+      const targetMax = p?.target_angle_max ?? 170
+      const state     = repStateRef.current
+      const now       = performance.now()
+      const exType    = exerciseTypeRef.current
+
+      // ── Exercise-specific state machines ─────────────────────────────
+      if (exType === 'squat') {
+        const torsoShoulder = lm[useLeft ? 11 : 12]
+        const torsoAngle    = getAngle(torsoShoulder, j1, j2)
+
+        if (state === STATE.IDLE && smoothAngle < 160) {
+          repStateRef.current = STATE.DESCENDING
+          minAngleThisRepRef.current = Infinity
+          repFiredRef.current = false
+          currentRepFlagsRef.current = []
+          speak(cfg.audio.start)
+
+        } else if (state === STATE.DESCENDING) {
+          minAngleThisRepRef.current = Math.min(minAngleThisRepRef.current, mainAngle)
+          if (lastTimeRef.current !== null && lastAngleRef.current !== null) {
+            const dt     = (now - lastTimeRef.current) / 1000
+            const dAngle = lastAngleRef.current - mainAngle
+            if (dt > 0 && dAngle / dt > 45 &&
+                !currentRepFlagsRef.current.includes('descent_too_fast')) {
+              currentRepFlagsRef.current.push('descent_too_fast')
+              speak('Slow down')
+            }
+          }
+          if (torsoAngle < 60 && !currentRepFlagsRef.current.includes('leaning_forward')) {
+            currentRepFlagsRef.current.push('leaning_forward')
+            speak('Stand up straighter')
+          }
+          if (smoothAngle <= targetMin + 10) {
+            repStateRef.current = STATE.HOLD
+            speak(cfg.audio.hold)
+          }
+
+        } else if (state === STATE.HOLD) {
+          minAngleThisRepRef.current = Math.min(minAngleThisRepRef.current, mainAngle)
+          if (torsoAngle < 60 && !currentRepFlagsRef.current.includes('leaning_forward')) {
+            currentRepFlagsRef.current.push('leaning_forward')
+            speak('Stand up straighter')
+          }
+          if (smoothAngle > targetMin + 15) {
+            repStateRef.current = STATE.ASCENDING
+            speak(cfg.audio.return)
+          }
+
+        } else if (state === STATE.ASCENDING && smoothAngle >= 160) {
+          if (!repFiredRef.current) {
+            repFiredRef.current = true
+            repStateRef.current = STATE.IDLE
+            repCountRef.current += 1
+            setRepCount(repCountRef.current)
+
+            const lowestAngle = Math.round(minAngleThisRepRef.current)
+            const depthScore  = lowestAngle <= 100 ? 50 : Math.max(0, 50 - (lowestAngle - 100) * 2)
+            const torsoDelta  = Math.abs(torsoAngle - 90)
+            const alignScore  = torsoDelta <= 15 ? 30 : Math.max(0, 30 - (torsoDelta - 15))
+            const structuralFlags = []
+            if (lowestAngle > 100) structuralFlags.push('too_shallow')
+            if (torsoDelta > 30)   structuralFlags.push('hip_misalignment')
+            if (lowestAngle < 60)  structuralFlags.push('dangerously deep')
+            const allFlags  = [...structuralFlags, ...currentRepFlagsRef.current]
+            const formScore = Math.max(0, Math.min(100, Math.round(depthScore + alignScore + 20 - allFlags.length * 10)))
+
+            speak(`Rep ${repCountRef.current} done. Form score ${formScore} percent.`)
+            onRepRef.current?.({
+              exercise_name: p?.exercise_name ?? 'squat',
+              [cfg.angleKey]: lowestAngle,
+              hip_angle:     Math.round(torsoAngle),
+              form_score:    formScore,
+              flags:         allFlags.join(','),
+              rep_number:    repCountRef.current,
+              set_number:    1,
+              session_id:    sessionId,
+              target_min:    targetMin,
+              target_max:    targetMax,
+            })
+            currentRepFlagsRef.current = []
+          }
+        }
+
+      } else if (exType === 'shoulder_flexion') {
+        if (state === STATE.IDLE && smoothAngle >= 40) {
+          repStateRef.current = STATE.DESCENDING
+          maxAngleThisRepRef.current = -Infinity
+          repFiredRef.current = false
+          currentRepFlagsRef.current = []
+          speak(cfg.audio.start)
+
+        } else if (state === STATE.DESCENDING) {
+          maxAngleThisRepRef.current = Math.max(maxAngleThisRepRef.current, mainAngle)
+          if (smoothAngle >= 150) {
+            repStateRef.current = STATE.HOLD
+            speak(cfg.audio.hold)
+          }
+
+        } else if (state === STATE.HOLD) {
+          maxAngleThisRepRef.current = Math.max(maxAngleThisRepRef.current, mainAngle)
+          if (smoothAngle < 140) {
+            repStateRef.current = STATE.ASCENDING
+            speak(cfg.audio.return)
+          }
+
+        } else if (state === STATE.ASCENDING) {
+          if (lastTimeRef.current !== null && lastAngleRef.current !== null) {
+            const dt     = (now - lastTimeRef.current) / 1000
+            const dAngle = lastAngleRef.current - mainAngle
+            if (dt > 0 && dAngle / dt > 60 &&
+                !currentRepFlagsRef.current.includes('dropping_too_fast')) {
+              currentRepFlagsRef.current.push('dropping_too_fast')
+              speak('Lower more slowly')
+            }
+          }
+          if (smoothAngle < 30 && !repFiredRef.current) {
+            repFiredRef.current = true
+            repStateRef.current = STATE.IDLE
+            repCountRef.current += 1
+            setRepCount(repCountRef.current)
+
+            const peakAngle  = Math.round(maxAngleThisRepRef.current)
+            const rangeScore = peakAngle >= 150 ? 50 : Math.max(0, 50 - (150 - peakAngle) * 1.5)
+            const allFlags   = [...currentRepFlagsRef.current]
+            const formScore  = Math.max(0, Math.min(100, Math.round(rangeScore + 50 - allFlags.length * 10)))
+
+            speak(`Rep ${repCountRef.current} done. Form score ${formScore} percent.`)
+            onRepRef.current?.({
+              exercise_name: p?.exercise_name ?? 'shoulder_flexion',
+              [cfg.angleKey]: peakAngle,
+              form_score:    formScore,
+              flags:         allFlags.join(','),
+              rep_number:    repCountRef.current,
+              set_number:    1,
+              session_id:    sessionId,
+            })
+            currentRepFlagsRef.current = []
+          }
+        }
+
+      } else if (exType === 'bicep_curl') {
+        const hipIdx    = useLeft ? 23 : 24
+        const kneeIdx   = useLeft ? 25 : 26
+        const torsoAngle = getAngle(j1, lm[hipIdx], lm[kneeIdx])
+
+        if (state === STATE.IDLE && smoothAngle < 140) {
+          repStateRef.current = STATE.DESCENDING
+          minAngleThisRepRef.current = Infinity
+          repFiredRef.current = false
+          currentRepFlagsRef.current = []
+          torsoAtCurlStartRef.current = torsoAngle
+          speak(cfg.audio.start)
+
+        } else if (state === STATE.DESCENDING) {
+          minAngleThisRepRef.current = Math.min(minAngleThisRepRef.current, mainAngle)
+          if (torsoAtCurlStartRef.current !== null &&
+              Math.abs(torsoAngle - torsoAtCurlStartRef.current) > 15 &&
+              !currentRepFlagsRef.current.includes('swinging_torso')) {
+            currentRepFlagsRef.current.push('swinging_torso')
+            speak('Keep your torso still')
+          }
+          if (smoothAngle < 50) {
+            repStateRef.current = STATE.HOLD
+            speak(cfg.audio.hold)
+          }
+
+        } else if (state === STATE.HOLD) {
+          minAngleThisRepRef.current = Math.min(minAngleThisRepRef.current, mainAngle)
+          if (smoothAngle > 60) {
+            repStateRef.current = STATE.ASCENDING
+            speak(cfg.audio.return)
+          }
+
+        } else if (state === STATE.ASCENDING) {
+          if (smoothAngle > 150 && !repFiredRef.current) {
+            repFiredRef.current = true
+            repStateRef.current = STATE.IDLE
+            repCountRef.current += 1
+            setRepCount(repCountRef.current)
+
+            const lowestAngle = Math.round(minAngleThisRepRef.current)
+            const depthScore  = lowestAngle <= 50 ? 50 : Math.max(0, 50 - (lowestAngle - 50) * 1.5)
+            const allFlags    = [...currentRepFlagsRef.current]
+            const formScore   = Math.max(0, Math.min(100, Math.round(depthScore + 50 - allFlags.length * 10)))
+
+            speak(`Rep ${repCountRef.current} done. Form score ${formScore} percent.`)
+            onRepRef.current?.({
+              exercise_name: p?.exercise_name ?? 'bicep_curl',
+              [cfg.angleKey]: lowestAngle,
+              form_score:    formScore,
+              flags:         allFlags.join(','),
+              rep_number:    repCountRef.current,
+              set_number:    1,
+              session_id:    sessionId,
+            })
+            currentRepFlagsRef.current  = []
+            torsoAtCurlStartRef.current = null
+          }
+        }
+      }
+
+      lastTimeRef.current  = now
+      lastAngleRef.current = mainAngle
     })
 
     navigator.mediaDevices
@@ -356,65 +565,47 @@ export default function PoseCamera({ patient, sessionId, onRep, mockMode = false
       .then((stream) => {
         video.srcObject = stream
         video.play()
-        setStatus('Camera ready — stand back so your full body is visible')
         const camera = new window.Camera(video, {
           onFrame: async () => { await pose.send({ image: video }) },
-          width: 640, height: 480,
+          width: 640,
+          height: 480,
         })
         camera.start()
       })
-      .catch(() => { setCameraError(true); setStatus('Camera access denied.') })
+      .catch(() => setCameraError(true))
 
     return () => {
       pose.close()
-      if (video?.srcObject) video.srcObject.getTracks().forEach(t => t.stop())
+      if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop())
     }
-  }, [mockMode, exerciseType])
+  }, [sessionId, mockMode])
 
-  if (cameraError && !mockMode) {
+  if (cameraError) {
     return (
-      <div className="w-full bg-white rounded-3xl shadow-soft p-10 text-center border border-danger-light">
-        <p className="text-danger font-semibold text-xl mb-2">Camera access denied</p>
-        <p className="text-charcoal-300 text-base leading-relaxed">
-          Allow camera access in your browser settings, then refresh.<br />
-          Or switch to Demo Mode to preview the UI.
+      <div className="w-full max-w-2xl mx-auto bg-gray-900 rounded-xl p-10 text-center border border-red-800">
+        <p className="text-2xl mb-2">📷</p>
+        <p className="text-red-400 font-semibold mb-1">Camera access denied</p>
+        <p className="text-gray-400 text-sm">
+          Open browser settings → allow camera for this site → refresh.
         </p>
       </div>
     )
   }
 
   return (
-    <div className="relative w-full rounded-3xl overflow-hidden shadow-card bg-charcoal-600">
+    <div className="relative w-full max-w-2xl mx-auto">
       <video ref={videoRef} className="hidden" playsInline muted />
-      <canvas ref={canvasRef} className="w-full block" style={{ transform: 'scaleX(-1)' }} />
-
-      {/* Status — bottom */}
-      <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between pointer-events-none">
-        <div className="glass-dark text-canvas-50 px-4 py-2 rounded-full text-sm font-medium max-w-[65%]">
-          {status}
+      {/* CSS scaleX(-1): natural selfie view. Canvas HUD uses counter-transform for readable text. */}
+      <canvas
+        ref={canvasRef}
+        className="w-full rounded-xl shadow-xl"
+        style={{ transform: mockMode ? 'none' : 'scaleX(-1)' }}
+      />
+      {mockMode && (
+        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/70 text-yellow-400 text-xs font-bold px-3 py-1 rounded-full">
+          DEMO MODE — pre-recorded session
         </div>
-        {currentAngle !== null && (
-          <motion.div
-            initial={{ scale: 0.8, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            className="glass-dark text-canvas-50 px-4 py-2 rounded-full text-sm font-bold"
-          >
-            {config.angleLabel} {currentAngle}°
-          </motion.div>
-        )}
-      </div>
-
-      {/* LIVE badge — top left */}
-      <div className="absolute top-4 left-4 flex items-center gap-2 glass-dark px-3 py-1.5 rounded-full">
-        <motion.div
-          animate={{ opacity: [1, 0.35, 1] }}
-          transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-          className="w-2 h-2 rounded-full bg-terra-400"
-        />
-        <span className="text-canvas-50 text-xs font-semibold uppercase tracking-wider">
-          {mockMode ? 'Demo' : 'Live'}
-        </span>
-      </div>
+      )}
     </div>
   )
 }
